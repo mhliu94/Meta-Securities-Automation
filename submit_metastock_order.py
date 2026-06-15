@@ -27,6 +27,20 @@ from pathlib import Path
 
 PACKAGE = "com.metaverse.secu.hk"
 REMOTE_XML = "/sdcard/metastock_window.xml"
+HOLDINGS_SCREENSHOT = Path("metastock_holdings.png")
+
+
+def rid(name: str) -> str:
+    return f"{PACKAGE}:id/{name}"
+
+
+STOCK_CODE_ID = rid("tv_stock_code")
+ORDER_INPUT_ID = rid("u9")
+BUY_TOGGLE_ID = rid("izx")
+SELL_TOGGLE_ID = rid("dd6")
+BUY_NOW_ID = rid("hx")
+SELL_NOW_ID = rid("s2")
+SEARCH_RESULT_SYMBOL_ID = rid("ihd")
 
 
 @dataclass(frozen=True)
@@ -37,6 +51,11 @@ class Node:
 
 class AutomationError(RuntimeError):
     pass
+
+
+@dataclass
+class MetaStockFlow:
+    adb: str
 
 
 def find_adb(explicit: str | None) -> str:
@@ -74,6 +93,18 @@ def run_adb(adb: str, args: list[str], *, check: bool = True) -> subprocess.Comp
     return proc
 
 
+def run_adb_bytes(adb: str, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    proc = subprocess.run(
+        [adb, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+        raise AutomationError(f"adb {' '.join(args)} failed: {detail}")
+    return proc
+
+
 def ensure_device(adb: str) -> None:
     proc = run_adb(adb, ["get-state"], check=False)
     state = proc.stdout.strip()
@@ -91,16 +122,22 @@ def shell(adb: str, *args: str) -> str:
 
 
 def dump_ui(adb: str) -> ET.Element:
+    run_adb(adb, ["shell", "rm", "-f", REMOTE_XML], check=False)
     shell(adb, "uiautomator", "dump", REMOTE_XML)
     xml_text = run_adb(adb, ["exec-out", "cat", REMOTE_XML]).stdout
+    if "<hierarchy" not in xml_text and "<displays" not in xml_text:
+        raise AutomationError(f"UI hierarchy dump did not produce XML: {xml_text.strip()}")
     root = ET.fromstring(xml_text)
     raise_if_app_crashed(root)
     return root
 
 
 def dump_ui_compressed(adb: str) -> ET.Element:
+    run_adb(adb, ["shell", "rm", "-f", REMOTE_XML], check=False)
     shell(adb, "uiautomator", "dump", "--compressed", REMOTE_XML)
     xml_text = run_adb(adb, ["exec-out", "cat", REMOTE_XML]).stdout
+    if "<hierarchy" not in xml_text and "<displays" not in xml_text:
+        raise AutomationError(f"Compressed UI hierarchy dump did not produce XML: {xml_text.strip()}")
     root = ET.fromstring(xml_text)
     raise_if_app_crashed(root)
     return root
@@ -110,6 +147,11 @@ def pull_screenshot(adb: str, local_path: Path) -> None:
     remote_path = "/sdcard/metastock_holdings_ocr.png"
     shell(adb, "screencap", "-p", remote_path)
     run_adb(adb, ["pull", remote_path, str(local_path)])
+
+
+def capture_screenshot(adb: str, local_path: Path) -> None:
+    proc = run_adb_bytes(adb, ["exec-out", "screencap", "-p"])
+    local_path.write_bytes(proc.stdout)
 
 
 def iter_nodes(root: ET.Element) -> list[Node]:
@@ -151,6 +193,10 @@ def tap_xy(adb: str, x: int, y: int) -> None:
     shell(adb, "input", "tap", str(x), str(y))
 
 
+def swipe_xy(adb: str, start_x: int, start_y: int, end_x: int, end_y: int, duration_ms: int = 300) -> None:
+    shell(adb, "input", "swipe", str(start_x), str(start_y), str(end_x), str(end_y), str(duration_ms))
+
+
 def wait_for_ui(adb: str, predicate, *, timeout: float = 8.0, interval: float = 0.4) -> ET.Element:
     deadline = time.time() + timeout
     last_root = None
@@ -174,6 +220,14 @@ def find_first(root: ET.Element, **criteria: str) -> ET.Element | None:
 
 def find_by_text(root: ET.Element, text: str) -> ET.Element | None:
     return find_first(root, text=text)
+
+
+def find_by_id(root: ET.Element, resource_id: str) -> ET.Element | None:
+    return find_first(root, **{"resource-id": resource_id})
+
+
+def find_by_id_or_text(root: ET.Element, resource_id: str, text: str) -> ET.Element | None:
+    return find_by_id(root, resource_id) or find_by_text(root, text)
 
 
 def find_all_by_text(root: ET.Element, text: str) -> list[ET.Element]:
@@ -299,9 +353,40 @@ def find_edit_by_hint(root: ET.Element, hint: str) -> ET.Element | None:
     return None
 
 
+def find_order_input(root: ET.Element, hint: str) -> ET.Element | None:
+    for node in root.iter("node"):
+        if (
+            attr(node, "resource-id") == ORDER_INPUT_ID
+            and attr(node, "class") == "android.widget.EditText"
+            and attr(node, "hint") == hint
+        ):
+            return node
+    return find_edit_by_hint(root, hint)
+
+
+def find_order_inputs(root: ET.Element) -> tuple[ET.Element | None, ET.Element | None]:
+    price_field = find_order_input(root, "Input price")
+    qty_field = find_order_input(root, "Input quantity")
+    if price_field is not None and qty_field is not None:
+        return price_field, qty_field
+
+    fields = [
+        node
+        for node in root.iter("node")
+        if attr(node, "resource-id") == ORDER_INPUT_ID and attr(node, "class") == "android.widget.EditText"
+    ]
+    if len(fields) >= 2:
+        return price_field or fields[0], qty_field or fields[1]
+    return price_field, qty_field
+
+
 def has_trade_ticket(root: ET.Element) -> bool:
+    has_submit = find_by_id(root, BUY_NOW_ID) is not None or find_by_id(root, SELL_NOW_ID) is not None
+    price_field, _ = find_order_inputs(root)
+    if has_submit and price_field is not None:
+        return True
     has_type = find_by_text(root, "Limit Order") is not None or find_by_text(root, "Enhanced Limit") is not None
-    return has_type and find_edit_by_hint(root, "Input price") is not None
+    return has_type and price_field is not None
 
 
 def has_order_page(root: ET.Element) -> bool:
@@ -373,6 +458,18 @@ def launch_metastock(adb: str) -> None:
     )
 
 
+def launch_metastock_for_ocr(adb: str) -> None:
+    run_adb(adb, ["shell", "monkey", "-p", PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"])
+    deadline = time.time() + 8.0
+    last_package: str | None = None
+    while time.time() < deadline:
+        time.sleep(0.4)
+        last_package = foreground_package(adb)
+        if last_package == PACKAGE:
+            return
+    raise AutomationError(f"MetaStock did not come to the foreground after launch. Foreground package: {last_package or 'unknown'}.")
+
+
 def require_logged_in(root: ET.Element) -> None:
     raise_if_login_required(root)
 
@@ -409,6 +506,11 @@ def ensure_trade_ticket(adb: str) -> ET.Element:
             root = wait_for_ui(adb, has_trade_ticket, timeout=8.0)
             require_logged_in(root)
             return root
+        if has_metastock_marker(root):
+            raise AutomationError(
+                "MetaStock is open, but the Trade control is not available. "
+                f"The trading account may be logged out or trading access is unavailable. Visible app text: {summarize_app_text(root)}"
+            )
         raise AutomationError("MetaStock is open, but the Trade control was not found.")
 
     tap(adb, trade)
@@ -446,7 +548,7 @@ def normalize_symbol(symbol: str) -> tuple[str, str]:
 
 
 def open_symbol_search(adb: str, root: ET.Element) -> ET.Element:
-    stock_code = find_first(root, **{"resource-id": f"{PACKAGE}:id/tv_stock_code"})
+    stock_code = find_by_id(root, STOCK_CODE_ID)
     if stock_code is not None:
         tap(adb, stock_code)
         return wait_for_ui(adb, lambda r: find_edit_by_hint(r, "Enter stock symbol / name") is not None)
@@ -463,7 +565,7 @@ def choose_symbol(adb: str, symbol: str) -> ET.Element:
     search_text, expected_symbol = normalize_symbol(symbol)
 
     root = ensure_trade_ticket(adb)
-    current = find_first(root, **{"resource-id": f"{PACKAGE}:id/tv_stock_code"})
+    current = find_by_id(root, STOCK_CODE_ID)
     if current is not None and attr(current, "text").upper() == expected_symbol:
         return root
 
@@ -476,13 +578,13 @@ def choose_symbol(adb: str, symbol: str) -> ET.Element:
 
     def exact_result_visible(r: ET.Element) -> bool:
         for node in r.iter("node"):
-            if attr(node, "resource-id") == f"{PACKAGE}:id/ihd" and attr(node, "text").upper() == expected_symbol:
+            if attr(node, "resource-id") == SEARCH_RESULT_SYMBOL_ID and attr(node, "text").upper() == expected_symbol:
                 return True
         return False
 
     root = wait_for_ui(adb, exact_result_visible, timeout=10.0)
     for node in root.iter("node"):
-        if attr(node, "resource-id") == f"{PACKAGE}:id/ihd" and attr(node, "text").upper() == expected_symbol:
+        if attr(node, "resource-id") == SEARCH_RESULT_SYMBOL_ID and attr(node, "text").upper() == expected_symbol:
             left, top, right, bottom = bounds(node)
             tap_xy(adb, 300, (top + bottom) // 2)
             break
@@ -490,7 +592,7 @@ def choose_symbol(adb: str, symbol: str) -> ET.Element:
         raise AutomationError(f"Could not find exact search result for {expected_symbol}.")
 
     def ticket_has_symbol(r: ET.Element) -> bool:
-        code = find_first(r, **{"resource-id": f"{PACKAGE}:id/tv_stock_code"})
+        code = find_by_id(r, STOCK_CODE_ID)
         return has_trade_ticket(r) and code is not None and attr(code, "text").upper() == expected_symbol
 
     return wait_for_ui(adb, ticket_has_symbol, timeout=10.0)
@@ -498,22 +600,22 @@ def choose_symbol(adb: str, symbol: str) -> ET.Element:
 
 def set_direction(adb: str, root: ET.Element, side: str) -> ET.Element:
     label = "Buy" if side.upper() == "BUY" else "Sell"
-    node = find_by_text(root, label)
+    toggle_id = BUY_TOGGLE_ID if side.upper() == "BUY" else SELL_TOGGLE_ID
+    node = find_by_id_or_text(root, toggle_id, label)
     if node is None:
         raise AutomationError(f"Could not find {label} direction toggle.")
     tap(adb, node)
-    return wait_for_ui(adb, lambda r: (find_by_text(r, label) is not None), timeout=4.0)
+    return wait_for_ui(adb, lambda r: (find_by_id_or_text(r, toggle_id, label) is not None), timeout=4.0)
 
 
 def fill_order(adb: str, root: ET.Element, price: str, quantity: str) -> ET.Element:
-    price_field = find_edit_by_hint(root, "Input price")
-    qty_field = find_edit_by_hint(root, "Input quantity")
+    price_field, qty_field = find_order_inputs(root)
     if price_field is None or qty_field is None:
         raise AutomationError("Could not find price and quantity inputs.")
 
     clear_and_type(adb, price_field, price)
     root = dump_ui(adb)
-    qty_field = find_edit_by_hint(root, "Input quantity")
+    _, qty_field = find_order_inputs(root)
     if qty_field is None:
         raise AutomationError("Quantity input disappeared after entering price.")
     clear_and_type(adb, qty_field, quantity)
@@ -522,23 +624,24 @@ def fill_order(adb: str, root: ET.Element, price: str, quantity: str) -> ET.Elem
 
 def verify_ticket(root: ET.Element, symbol: str, side: str, price: str, quantity: str) -> ET.Element:
     _, expected_symbol = normalize_symbol(symbol)
-    code = find_first(root, **{"resource-id": f"{PACKAGE}:id/tv_stock_code"})
+    code = find_by_id(root, STOCK_CODE_ID)
     if code is None or attr(code, "text").upper() != expected_symbol:
         raise AutomationError(f"Expected symbol {expected_symbol}, found {attr(code, 'text') if code is not None else 'none'}.")
 
-    direction = find_by_text(root, "Buy" if side.upper() == "BUY" else "Sell")
+    direction_id = BUY_TOGGLE_ID if side.upper() == "BUY" else SELL_TOGGLE_ID
+    direction = find_by_id_or_text(root, direction_id, "Buy" if side.upper() == "BUY" else "Sell")
     if direction is None or attr(direction, "selected") != "true":
         raise AutomationError(f"Expected {side.upper()} direction to be selected.")
 
-    price_field = find_edit_by_hint(root, "Input price")
-    qty_field = find_edit_by_hint(root, "Input quantity")
+    price_field, qty_field = find_order_inputs(root)
     if price_field is None or attr(price_field, "text") != price:
         raise AutomationError(f"Expected price {price}, found {attr(price_field, 'text') if price_field is not None else 'none'}.")
     if qty_field is None or attr(qty_field, "text") != quantity:
         raise AutomationError(f"Expected quantity {quantity}, found {attr(qty_field, 'text') if qty_field is not None else 'none'}.")
 
     button_label = "Buy Now" if side.upper() == "BUY" else "Sell Now"
-    button = find_by_text(root, button_label)
+    button_id = BUY_NOW_ID if side.upper() == "BUY" else SELL_NOW_ID
+    button = find_by_id_or_text(root, button_id, button_label)
     if button is None:
         raise AutomationError(f"Expected final button {button_label!r} was not found.")
     return button
@@ -808,6 +911,49 @@ def submit_order_with_confirmation(
     print(f"Last visible app text: {message}")
 
 
+class SubmitNewOrderFlow(MetaStockFlow):
+    def prepare_ticket(self, symbol: str, side: str, price: str, quantity: str) -> ET.Element:
+        side = side.upper()
+        root = choose_symbol(self.adb, symbol)
+        root = set_direction(self.adb, root, side)
+        root = fill_order(self.adb, root, price, quantity)
+        return verify_ticket(root, symbol, side, price, quantity)
+
+    def run(
+        self,
+        symbol: str,
+        side: str,
+        price: str,
+        quantity: str,
+        *,
+        submit: bool,
+        confirm_timeout: float,
+        result_timeout: float,
+        trading_password: str | None,
+        trading_password_env: str,
+        prompt_trading_password: bool,
+    ) -> None:
+        side = side.upper()
+        final_button = self.prepare_ticket(symbol, side, price, quantity)
+
+        print(f"Ticket verified: {side} {normalize_symbol(symbol)[1]} {quantity} @ {price}")
+
+        if not submit:
+            print("Dry run only. Re-run with --submit to tap the live order button.")
+            return
+
+        submit_order_with_confirmation(
+            self.adb,
+            final_button,
+            side,
+            confirm_timeout=confirm_timeout,
+            result_timeout=result_timeout,
+            trading_password=trading_password,
+            prompt_trading_password=prompt_trading_password,
+            trading_password_env=trading_password_env,
+        )
+
+
 def open_account_page(adb: str) -> ET.Element:
     launch_metastock(adb)
     root = dump_ui_compressed(adb)
@@ -1006,8 +1152,10 @@ def powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def ocr_image_with_windows(image_path: Path) -> list[str]:
+def ocr_words_with_windows(image_path: Path) -> list[dict]:
     ps = f"""
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
 [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
@@ -1029,39 +1177,643 @@ $bitmap = AwaitOp ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 if ($null -eq $engine) {{ throw 'Windows OCR engine is not available.' }}
 $result = AwaitOp ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-$result.Lines | ForEach-Object {{ $_.Text }}
+$items = @()
+foreach ($line in $result.Lines) {{
+  foreach ($word in $line.Words) {{
+    $r = $word.BoundingRect
+    $items += [pscustomobject]@{{
+      text = $word.Text
+      x = [double]$r.X
+      y = [double]$r.Y
+      w = [double]$r.Width
+      h = [double]$r.Height
+    }}
+  }}
+}}
+$items | ConvertTo-Json -Compress -Depth 3
 """
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
         raise AutomationError(f"Windows OCR failed: {(proc.stderr or proc.stdout).strip()}")
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    output = proc.stdout.strip()
+    if not output:
+        return []
+    parsed = json.loads(output)
+    if isinstance(parsed, dict):
+        return [parsed]
+    return parsed
 
 
-def collect_holdings_from_ocr(adb: str) -> dict:
-    image_path = Path("metastock_holdings_ocr.png")
-    pull_screenshot(adb, image_path)
-    lines = ocr_image_with_windows(image_path)
+def normalized_ocr_number(text: str) -> str:
+    cleaned = text.strip().replace("—", "-").replace("−", "-")
+    cleaned = cleaned.replace("\u2014", "-").replace("\u2212", "-")
+    if "\u00af" in cleaned:
+        without_overline = cleaned.replace("\u00af", "").strip()
+        if without_overline and not without_overline.startswith("-"):
+            cleaned = f"-{without_overline}"
+        else:
+            cleaned = without_overline
+    if cleaned in {"o", "O"}:
+        return "0"
+    if cleaned.rstrip().endswith(","):
+        return ""
+    cleaned = re.sub(r"\b[Io]\s+\.(?=\d)", lambda match: f"{'1' if match.group(0)[0] == 'I' else '0'}.", cleaned)
+    cleaned = re.sub(r",\s+", ",", cleaned)
+    candidate_text = cleaned.replace("I", "1").replace("O", "0").replace("o", "0")
+    candidate_text = re.sub(r"(?<=\d)\s+\.(?=\d)", ".", candidate_text)
+    candidates = [
+        candidate
+        for candidate in re.findall(r"-?(?:\d[\d,]*\.?\d*|\.\d+)%?", candidate_text)
+        if not candidate.rstrip().endswith(",")
+    ]
+    if candidates and candidate_text.strip() != cleaned.strip():
+        return candidates[0]
+    compact = cleaned.replace(" ", "").replace(",", "")
+    if compact == "-":
+        return ""
+    if compact == "--":
+        return cleaned
+    if re.fullmatch(r"-?\d+(?:\.\d+)?%?", compact):
+        return cleaned
+    if candidates:
+        return candidates[0]
+    if cleaned:
+        return ""
+    return cleaned
+
+
+def words_in_region(words: list[dict], *, x_min: float = 0, x_max: float = 1080, y_min: float = 0, y_max: float = 2424) -> list[dict]:
+    found = []
+    for word in words:
+        x = float(word.get("x", 0))
+        y = float(word.get("y", 0))
+        w = float(word.get("w", 0))
+        h = float(word.get("h", 0))
+        cx = x + w / 2
+        cy = y + h / 2
+        if x_min <= cx <= x_max and y_min <= cy <= y_max:
+            found.append(word)
+    return sorted(found, key=lambda item: (float(item.get("y", 0)), float(item.get("x", 0))))
+
+
+def text_in_region(words: list[dict], *, x_min: float = 0, x_max: float = 1080, y_min: float = 0, y_max: float = 2424) -> str:
+    return " ".join(str(word.get("text", "")) for word in words_in_region(words, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)).strip()
+
+
+def number_in_region(words: list[dict], *, x_min: float, x_max: float, y_min: float, y_max: float) -> str:
+    text = text_in_region(words, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)
+    return normalized_ocr_number(text)
+
+
+def first_word_center_y(words: list[dict], prefix: str, *, x_min: float, x_max: float, y_min: float, y_max: float) -> float | None:
+    prefix_lower = prefix.lower()
+    for word in words_in_region(words, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max):
+        if str(word.get("text", "")).lower().startswith(prefix_lower):
+            return float(word["y"]) + float(word["h"]) / 2
+    return None
+
+
+def first_word_center(words: list[dict], prefix: str, *, x_min: float, x_max: float, y_min: float, y_max: float) -> tuple[int, int] | None:
+    prefix_lower = prefix.lower()
+    for word in words_in_region(words, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max):
+        if str(word.get("text", "")).lower().startswith(prefix_lower):
+            x = float(word["x"]) + float(word["w"]) / 2
+            y = float(word["y"]) + float(word["h"]) / 2
+            return int(x), int(y)
+    return None
+
+
+def find_table_header_y(words: list[dict]) -> float:
+    header_words = words_in_region(words, x_min=0, x_max=1080, y_min=700, y_max=1800)
+    for word in header_words:
+        if str(word.get("text", "")).lower().startswith("symbol"):
+            return float(word["y"]) + float(word["h"]) / 2
+    return 450
+
+
+def find_position_symbols(words: list[dict]) -> list[tuple[str, float]]:
+    rows: list[tuple[str, float]] = []
+    header_y = find_table_header_y(words)
+    left_words = words_in_region(words, x_min=0, x_max=300, y_min=header_y + 35, y_max=2150)
+    by_line: list[list[dict]] = []
+    for word in left_words:
+        cy = float(word["y"]) + float(word["h"]) / 2
+        for line in by_line:
+            line_cy = sum(float(item["y"]) + float(item["h"]) / 2 for item in line) / len(line)
+            if abs(cy - line_cy) <= 18:
+                line.append(word)
+                break
+        else:
+            by_line.append([word])
+
+    for line in by_line:
+        line.sort(key=lambda item: float(item["x"]))
+        text = "".join(str(item["text"]) for item in line)
+        normalized = text.replace(" ", "")
+        match = re.search(r"([A-Za-z0-9]+\.US)", normalized)
+        if match is None:
+            continue
+        symbol = match.group(1).upper()
+        cy = sum(float(item["y"]) + float(item["h"]) / 2 for item in line) / len(line)
+        rows.append((symbol, cy))
+    return rows
+
+
+def parse_position_left_rows(words: list[dict]) -> list[dict]:
+    positions = []
+    for symbol, symbol_y in find_position_symbols(words):
+        value_y = symbol_y - 65
+        name = text_in_region(words, x_min=40, x_max=290, y_min=value_y - 32, y_max=value_y + 32)
+        market_value = number_in_region(words, x_min=250, x_max=470, y_min=value_y - 35, y_max=value_y + 35)
+        quantity = number_in_region(words, x_min=250, x_max=470, y_min=symbol_y - 30, y_max=symbol_y + 30)
+        if not quantity and market_value in {"0", "0.00"}:
+            quantity = "0"
+        positions.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "market_value": market_value,
+                "quantity": quantity,
+                "price": number_in_region(words, x_min=430, x_max=650, y_min=value_y - 35, y_max=value_y + 35),
+                "cost": number_in_region(words, x_min=430, x_max=650, y_min=symbol_y - 30, y_max=symbol_y + 30),
+                "daily_pnl": number_in_region(words, x_min=590, x_max=860, y_min=value_y - 35, y_max=value_y + 35),
+                "daily_pnl_pct": number_in_region(words, x_min=590, x_max=860, y_min=symbol_y - 30, y_max=symbol_y + 30),
+                "position_pnl": "",
+                "position_pnl_pct": "",
+                "_symbol_y": symbol_y,
+            }
+        )
+    return positions
+
+
+def find_position_pnl_x_min(words: list[dict]) -> float | None:
+    header_words = words_in_region(words, x_min=300, x_max=1080, y_min=900, y_max=1500)
+    for word in header_words:
+        text = str(word.get("text", "")).lower()
+        if text.startswith("posit"):
+            return max(300, float(word["x"]) - 30)
+    return None
+
+
+def parse_position_right_fields(words: list[dict], left_rows: list[dict], *, x_min: float | None = None) -> dict[str, dict]:
+    position_pnl_x_min = x_min if x_min is not None else find_position_pnl_x_min(words)
+    if position_pnl_x_min is None:
+        return {}
+
+    parsed: dict[str, dict] = {}
+
+    right_symbols = {symbol: y for symbol, y in find_position_symbols(words)}
+    for left in left_rows:
+        symbol = left["symbol"]
+        symbol_y = right_symbols.get(symbol, left.get("_symbol_y", 0))
+        value_y = float(symbol_y) - 65
+        parsed[symbol] = {
+            "position_pnl": number_in_region(words, x_min=position_pnl_x_min, x_max=1080, y_min=value_y - 35, y_max=value_y + 35),
+            "position_pnl_pct": number_in_region(words, x_min=position_pnl_x_min, x_max=1080, y_min=float(symbol_y) - 30, y_max=float(symbol_y) + 30),
+        }
+    return parsed
+
+
+def merge_position(existing: dict, update: dict, *, prefer_update: bool = False) -> dict:
+    merged = dict(existing)
+    for key, value in update.items():
+        if key.startswith("_"):
+            continue
+        if value and (prefer_update or not merged.get(key)):
+            merged[key] = value
+        elif value and key in {"position_pnl", "position_pnl_pct"}:
+            merged[key] = value
+    return merged
+
+
+def collect_holdings_from_account_screen(words: list[dict]) -> dict:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    if "Open Acc" in all_text or "Speed Account Opening" in all_text:
+        raise AutomationError("MetaStock is showing Open Acc instead of holdings. Log in/link the trading account before querying holdings.")
+    if "Account" not in all_text or "US" not in all_text:
+        raise AutomationError(f"Account screen OCR did not find holdings text: {all_text[:300]}")
+
+    account = text_in_region(words, x_min=130, x_max=620, y_min=280, y_max=370)
+    currency = text_in_region(words, x_min=850, x_max=1000, y_min=390, y_max=470) or "HKD"
+
+    us_account_y = first_word_center_y(words, "US", x_min=80, x_max=360, y_min=800, y_max=1800) or 1050
+    hk_account_y = first_word_center_y(words, "HK", x_min=80, x_max=360, y_min=1500, y_max=2300) or 2050
+    us_value = number_in_region(words, x_min=40, x_max=390, y_min=us_account_y + 55, y_max=us_account_y + 170)
+    us_daily_pnl = number_in_region(words, x_min=620, x_max=830, y_min=us_account_y + 95, y_max=us_account_y + 190)
+    us_total_pnl = number_in_region(words, x_min=840, x_max=1040, y_min=us_account_y + 95, y_max=us_account_y + 190)
+    hk_value = number_in_region(words, x_min=40, x_max=250, y_min=hk_account_y + 55, y_max=hk_account_y + 170)
+    hk_daily_pnl = number_in_region(words, x_min=620, x_max=850, y_min=hk_account_y + 95, y_max=hk_account_y + 190)
+    hk_total_pnl = number_in_region(words, x_min=850, x_max=1040, y_min=hk_account_y + 95, y_max=hk_account_y + 190)
+
+    positions = parse_position_left_rows(words)
+
     return {
-        "source": "windows_ocr",
-        "account": "US Account",
-        "currency": "USD",
-        "ocr_lines": lines,
-        "cash_accounts": [],
-        "positions": [],
+        "source": "account_screen_ocr",
+        "account": account or "Account",
+        "currency": currency,
+        "net_liquidation_value": "",
+        "stock_market_value": us_value,
+        "buying_power": "",
+        "withdrawable_cash": "",
+        "daily_pnl": us_daily_pnl,
+        "position_pnl": us_total_pnl,
+        "cash_accounts": [
+            {"account": "US Account(USD)", "value": us_value, "daily_pnl": us_daily_pnl, "total_pnl": us_total_pnl},
+            {"account": "HK Account(HKD)", "value": hk_value, "daily_pnl": hk_daily_pnl, "total_pnl": hk_total_pnl},
+        ],
+        "positions": positions,
     }
 
 
-def query_holdings(adb: str) -> dict:
-    try:
-        root = open_us_account_detail_page(adb)
-        return collect_us_account_snapshot(root)
-    except AutomationError:
-        return collect_holdings_from_ocr(adb)
+def collect_account_detail_from_screen(words: list[dict]) -> dict:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    has_buying_power_label = "Buying" in all_text and "Power" in all_text
+    has_detail_label = "Liquidation" in all_text and ("US Account" in all_text or "HK Account" in all_text)
+    if "Account" not in all_text or not (has_buying_power_label or has_detail_label):
+        return {}
+
+    currency = "USD" if "US Account" in all_text or "(USD)" in all_text else "HKD"
+    return {
+        "source": "account_detail_ocr",
+        "account": "US Account" if currency == "USD" else "HK Account",
+        "currency": currency,
+        "net_liquidation_value": number_in_region(words, x_min=55, x_max=530, y_min=400, y_max=540),
+        "position_pnl": number_in_region(words, x_min=830, x_max=1040, y_min=400, y_max=465),
+        "daily_pnl": number_in_region(words, x_min=830, x_max=1040, y_min=465, y_max=535),
+        "stock_market_value": number_in_region(words, x_min=50, x_max=260, y_min=620, y_max=690),
+        "buying_power": number_in_region(words, x_min=360, x_max=610, y_min=620, y_max=690),
+        "withdrawable_cash": number_in_region(words, x_min=680, x_max=860, y_min=620, y_max=690),
+    }
+
+
+def merge_account_detail(snapshot: dict, detail: dict) -> None:
+    if not detail:
+        return
+
+    for key in (
+        "currency",
+        "net_liquidation_value",
+        "stock_market_value",
+        "buying_power",
+        "withdrawable_cash",
+        "daily_pnl",
+        "position_pnl",
+    ):
+        value = detail.get(key)
+        if value:
+            snapshot[key] = value
+
+    for item in snapshot.get("cash_accounts", []):
+        if str(item.get("account", "")).startswith(detail.get("account", "")):
+            for key in (
+                "net_liquidation_value",
+                "stock_market_value",
+                "buying_power",
+                "withdrawable_cash",
+            ):
+                item[key] = detail.get(key, "")
+            break
+
+
+def raise_if_ocr_app_problem(words: list[dict]) -> None:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    lower_text = all_text.lower()
+    crash_markers = [
+        "keeps stopping",
+        "has stopped",
+        "isn't responding",
+        "is not responding",
+        "close app",
+        "app info",
+        "wait",
+    ]
+    if "metastock" in lower_text and any(marker in lower_text for marker in crash_markers):
+        raise AutomationError(f"MetaStock appears to have crashed or stopped responding: {all_text[:300]}")
+
+    login_markers = [
+        "login/register",
+        "log in",
+        "login",
+        "sign in",
+        "please login",
+        "please log in",
+    ]
+    if any(marker in lower_text for marker in login_markers):
+        raise AutomationError(f"MetaStock trading account is not logged in: {all_text[:300]}")
+
+    if "Open Acc" in all_text or "Speed Account Opening" in all_text:
+        raise AutomationError("MetaStock is showing Open Acc instead of holdings. Log in/link the trading account before querying holdings.")
+
+
+def raise_if_not_holdings_screen(words: list[dict]) -> None:
+    if not is_holdings_screen(words):
+        all_text = " ".join(str(word.get("text", "")) for word in words)
+        raise AutomationError(f"MetaStock Account holdings screen is not visible: {all_text[:300]}")
+
+
+def is_holdings_screen(words: list[dict]) -> bool:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    holdings_markers = ["Net Asset Value", "US Account", "HK Account", "Position", "Today's Order"]
+    return (
+        "Account" in all_text
+        and any(marker in all_text for marker in holdings_markers)
+        and "Watchlist" in all_text
+        and "Me" in all_text
+    )
+
+
+def declared_position_count(words: list[dict]) -> int | None:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    match = re.search(r"Position\s*\((\d+)\)", all_text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def has_position_action_overlay(words: list[dict]) -> bool:
+    visible = {str(word.get("text", "")) for word in words}
+    return {"Quote", "Buy", "Sell", "Share"}.issubset(visible)
+
+
+def capture_raw_ocr_words(adb: str) -> list[dict]:
+    capture_screenshot(adb, HOLDINGS_SCREENSHOT)
+    return ocr_words_with_windows(HOLDINGS_SCREENSHOT)
+
+
+def is_account_detail_screen(words: list[dict]) -> bool:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    if "Watchlist" in all_text or "Me" in all_text:
+        return False
+    account_title = "HK Account" in all_text or "US Account" in all_text
+    return account_title and "Net Liquidation Value" in all_text and "Positions" in all_text
+
+
+def return_to_holdings_from_account_detail(adb: str) -> list[dict]:
+    last_words: list[dict] = []
+    for _ in range(4):
+        if foreground_package(adb) != PACKAGE:
+            launch_metastock_for_ocr(adb)
+            time.sleep(1.0)
+
+        last_words = capture_raw_ocr_words(adb)
+        if is_holdings_screen(last_words) and not is_account_detail_screen(last_words):
+            return last_words
+
+        all_text = " ".join(str(word.get("text", "")) for word in last_words)
+        if is_account_detail_screen(last_words) or ("Account" in all_text and "Liquidation" in all_text):
+            tap_xy(adb, 72, 190)
+        else:
+            tap_xy(adb, 756, 2295)
+        time.sleep(1.0)
+
+    return last_words
+
+
+def leave_account_detail_if_visible(adb: str) -> bool:
+    for _ in range(4):
+        words = capture_raw_ocr_words(adb)
+        if not is_account_detail_screen(words):
+            time.sleep(0.25)
+            continue
+
+        words = return_to_holdings_from_account_detail(adb)
+        return not is_account_detail_screen(words)
+    return False
+
+
+def dismiss_position_action_overlay(adb: str) -> None:
+    shell(adb, "input", "keyevent", "BACK")
+    time.sleep(0.5)
+
+
+def capture_holdings_words(adb: str) -> list[dict]:
+    for _ in range(3):
+        words = capture_raw_ocr_words(adb)
+        if not has_position_action_overlay(words):
+            raise_if_ocr_app_problem(words)
+            raise_if_not_holdings_screen(words)
+            return words
+        dismiss_position_action_overlay(adb)
+    raise AutomationError("MetaStock position action overlay is still visible and blocking holdings OCR.")
+
+
+def table_horizontal_swipe_y(words: list[dict]) -> int:
+    symbols = find_position_symbols(words)
+    if symbols:
+        return int(min(2050, max(1200, symbols[0][1])))
+    header_y = find_table_header_y(words)
+    return int(min(1800, max(1200, header_y + 80)))
+
+
+def reveal_position_pnl_columns(adb: str, words: list[dict]) -> None:
+    y = table_horizontal_swipe_y(words)
+    swipe_xy(adb, 980, y, 260, y, 80)
+
+
+def is_today_order_table_visible(words: list[dict]) -> bool:
+    header_text = text_in_region(words, x_min=250, x_max=1080, y_min=1300, y_max=1450)
+    body_text = text_in_region(words, x_min=250, x_max=1080, y_min=1450, y_max=1800)
+    return "Order No" in header_text or "Status" in header_text or "Completed" in body_text
+
+
+def select_position_table(adb: str, words: list[dict]) -> list[dict]:
+    if not is_today_order_table_visible(words):
+        return words
+
+    position_tab = first_word_center(words, "Position", x_min=80, x_max=360, y_min=1150, y_max=1350)
+    if position_tab is None:
+        return words
+
+    tap_xy(adb, *position_tab)
+    time.sleep(0.8)
+    return capture_holdings_words(adb)
+
+
+def scroll_account_to_top(adb: str) -> None:
+    swipe_xy(adb, 540, 900, 540, 1850, 500)
+
+
+def reset_position_table_layout(adb: str) -> None:
+    swipe_xy(adb, 540, 1800, 540, 1200, 400)
+    time.sleep(0.5)
+    swipe_xy(adb, 540, 1200, 540, 1800, 400)
+    time.sleep(0.5)
+
+
+def scroll_positions_down(adb: str) -> None:
+    swipe_xy(adb, 540, 1880, 540, 1250, 450)
+
+
+def strip_internal_position_fields(position: dict) -> dict:
+    return {key: value for key, value in position.items() if not key.startswith("_")}
+
+
+def merge_visible_positions(
+    positions_by_symbol: dict[str, dict],
+    left_rows: list[dict],
+    right_fields_by_symbol: dict[str, dict],
+) -> None:
+    for row in left_rows:
+        symbol = row["symbol"]
+        merged = merge_position(row, right_fields_by_symbol.get(symbol, {}))
+        if symbol in positions_by_symbol:
+            positions_by_symbol[symbol] = merge_position(positions_by_symbol[symbol], merged)
+        else:
+            positions_by_symbol[symbol] = merged
+
+
+def position_fields_have_values(right_fields_by_symbol: dict[str, dict]) -> bool:
+    for fields in right_fields_by_symbol.values():
+        value = fields.get("position_pnl", "")
+        compact = str(value).replace(",", "").replace(" ", "")
+        if re.fullmatch(r"-?\d+\.\d+", compact):
+            return True
+    return False
+
+
+class QueryHoldingsFlow(MetaStockFlow):
+    def open_account_words(self) -> list[dict]:
+        last_error: AutomationError | None = None
+        for attempt in range(3):
+            launch_metastock_for_ocr(self.adb)
+            leave_account_detail_if_visible(self.adb)
+            tap_xy(self.adb, 756, 2295)
+            time.sleep(3.0)
+            if leave_account_detail_if_visible(self.adb):
+                tap_xy(self.adb, 756, 2295)
+                time.sleep(3.0)
+            for _ in range(2):
+                scroll_account_to_top(self.adb)
+                time.sleep(0.2)
+            reset_position_table_layout(self.adb)
+            try:
+                words = capture_holdings_words(self.adb)
+                words = select_position_table(self.adb, words)
+                collect_holdings_from_account_screen(words)
+                return words
+            except AutomationError as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise
+                launch_metastock_for_ocr(self.adb)
+                time.sleep(0.5)
+        raise last_error or AutomationError("Could not read holdings from the Account screen.")
+
+    def collect_us_account_detail(self, main_words: list[dict]) -> dict:
+        words = main_words
+        for _ in range(2):
+            us_account_y = first_word_center_y(words, "US", x_min=80, x_max=360, y_min=800, y_max=1800)
+            if us_account_y is None:
+                time.sleep(0.6)
+                words = capture_holdings_words(self.adb)
+                continue
+
+            tap_xy(self.adb, 180, int(us_account_y + 35))
+            time.sleep(1.6)
+            detail_words = capture_raw_ocr_words(self.adb)
+            detail = collect_account_detail_from_screen(detail_words)
+            detail_text = " ".join(str(word.get("text", "")) for word in detail_words)
+            opened_detail = is_account_detail_screen(detail_words) or (
+                "Account" in detail_text and "Net" in detail_text and "Liquidation" in detail_text
+            )
+            if detail or opened_detail:
+                words = return_to_holdings_from_account_detail(self.adb)
+                if detail:
+                    return detail
+                continue
+
+            if has_position_action_overlay(detail_words):
+                dismiss_position_action_overlay(self.adb)
+                words = capture_holdings_words(self.adb)
+                continue
+            words = detail_words
+        return {}
+
+    def query(self, *, max_pages: int = 20) -> dict:
+        if max_pages <= 0:
+            raise AutomationError("--holdings-max-pages must be greater than zero.")
+
+        first_words = self.open_account_words()
+        detail = self.collect_us_account_detail(first_words)
+        first_words = capture_holdings_words(self.adb)
+        first_words = select_position_table(self.adb, first_words)
+        snapshot = collect_holdings_from_account_screen(first_words)
+        merge_account_detail(snapshot, detail)
+        positions_by_symbol: dict[str, dict] = {}
+        seen_pages: set[str] = set()
+        position_pnl_x_min: float | None = None
+        expected_position_count = declared_position_count(first_words)
+        left_words = first_words
+
+        for page_index in range(max_pages):
+            left_rows = snapshot["positions"] if page_index == 0 else parse_position_left_rows(left_words)
+            page_signature = "|".join(row["symbol"] for row in left_rows)
+            if not left_rows or page_signature in seen_pages:
+                break
+            seen_pages.add(page_signature)
+
+            detected_x_min = find_position_pnl_x_min(left_words)
+            if detected_x_min is not None:
+                position_pnl_x_min = detected_x_min
+                right_fields_by_symbol = parse_position_right_fields(
+                    left_words,
+                    left_rows,
+                    x_min=position_pnl_x_min,
+                )
+            else:
+                right_fields_by_symbol = {}
+
+            if not position_fields_have_values(right_fields_by_symbol):
+                for _ in range(2):
+                    reveal_position_pnl_columns(self.adb, left_words)
+                    time.sleep(0.5)
+                    right_words = capture_holdings_words(self.adb)
+                    right_left_rows_by_symbol = {
+                        row["symbol"]: row for row in parse_position_left_rows(right_words)
+                    }
+                    left_rows = [
+                        merge_position(row, right_left_rows_by_symbol.get(row["symbol"], {}), prefer_update=True)
+                        for row in left_rows
+                    ]
+                    detected_x_min = find_position_pnl_x_min(right_words)
+                    if detected_x_min is not None:
+                        position_pnl_x_min = detected_x_min
+                    right_fields_by_symbol = parse_position_right_fields(
+                        right_words,
+                        left_rows,
+                        x_min=position_pnl_x_min,
+                    )
+                    if position_fields_have_values(right_fields_by_symbol):
+                        break
+
+            merge_visible_positions(positions_by_symbol, left_rows, right_fields_by_symbol)
+
+            if expected_position_count is not None and len(positions_by_symbol) >= expected_position_count:
+                break
+            if page_index == max_pages - 1:
+                break
+            scroll_positions_down(self.adb)
+            time.sleep(0.8)
+            left_words = capture_holdings_words(self.adb)
+
+        snapshot["source"] = "account_screen_ocr_scroll"
+        snapshot["positions"] = [strip_internal_position_fields(position) for position in positions_by_symbol.values()]
+        return snapshot
+
+
+def open_account_ocr_words(adb: str) -> list[dict]:
+    return QueryHoldingsFlow(adb).open_account_words()
+
+
+def query_holdings(adb: str, *, max_pages: int = 20) -> dict:
+    return QueryHoldingsFlow(adb).query(max_pages=max_pages)
 
 
 def print_holdings(snapshot: dict) -> None:
@@ -1287,58 +2039,69 @@ def cancel_one_order_row(adb: str, row: OrderRow) -> None:
     time.sleep(1.0)
 
 
+class CancelOrdersFlow(MetaStockFlow):
+    def cancel_pending(self, *, execute: bool, symbol: str | None = None) -> int:
+        expected_symbol = normalize_symbol(symbol)[1] if symbol else None
+        target_label = expected_symbol if expected_symbol else "all symbols"
+        root = open_order_page(self.adb)
+        root = select_pending_queue_filter(self.adb, root)
+
+        seen_pages: set[str] = set()
+        matched: list[OrderRow] = []
+        cancelled = 0
+
+        while True:
+            root = dump_ui(self.adb)
+            rows = visible_order_rows(root)
+            matching_rows = [row for row in rows if expected_symbol is None or row.symbol == expected_symbol]
+
+            if execute and matching_rows:
+                row = matching_rows[0]
+                print(f"Cancelling pending order: {row.side} {row.symbol} qty={row.quantity} price={row.price}")
+                cancel_one_order_row(self.adb, row)
+                cancelled += 1
+                root = open_order_page(self.adb)
+                select_pending_queue_filter(self.adb, root)
+                continue
+
+            matched.extend(row for row in matching_rows if row.signature not in {known.signature for known in matched})
+
+            page_signature = "|".join(row.signature for row in rows)
+            if not rows or page_signature in seen_pages:
+                break
+            seen_pages.add(page_signature)
+            scroll_order_list(self.adb)
+
+        if not execute:
+            if matched:
+                print(f"Dry run: found {len(matched)} pending order(s) for {target_label}:")
+                for row in matched:
+                    print(f"- {row.side} {row.symbol} qty={row.quantity} price={row.price} status={row.status}")
+                print("Re-run with --execute-cancel to cancel them.")
+            else:
+                print(f"No pending orders found for {target_label}.")
+            return len(matched)
+
+        print(f"Cancelled {cancelled} pending order(s) for {target_label}.")
+        return cancelled
+
+    def cancel_symbol(self, symbol: str, *, execute: bool) -> int:
+        return self.cancel_pending(execute=execute, symbol=symbol)
+
+    def cancel_all(self, *, execute: bool) -> int:
+        return self.cancel_pending(execute=execute, symbol=None)
+
+
 def cancel_pending_orders(adb: str, *, execute: bool, symbol: str | None = None) -> int:
-    expected_symbol = normalize_symbol(symbol)[1] if symbol else None
-    target_label = expected_symbol if expected_symbol else "all symbols"
-    root = open_order_page(adb)
-    root = select_pending_queue_filter(adb, root)
-
-    seen_pages: set[str] = set()
-    matched: list[OrderRow] = []
-    cancelled = 0
-
-    while True:
-        root = dump_ui(adb)
-        rows = visible_order_rows(root)
-        matching_rows = [row for row in rows if expected_symbol is None or row.symbol == expected_symbol]
-
-        if execute and matching_rows:
-            row = matching_rows[0]
-            print(f"Cancelling pending order: {row.side} {row.symbol} qty={row.quantity} price={row.price}")
-            cancel_one_order_row(adb, row)
-            cancelled += 1
-            root = open_order_page(adb)
-            select_pending_queue_filter(adb, root)
-            continue
-
-        matched.extend(row for row in matching_rows if row.signature not in {known.signature for known in matched})
-
-        page_signature = "|".join(row.signature for row in rows)
-        if not rows or page_signature in seen_pages:
-            break
-        seen_pages.add(page_signature)
-        scroll_order_list(adb)
-
-    if not execute:
-        if matched:
-            print(f"Dry run: found {len(matched)} pending order(s) for {target_label}:")
-            for row in matched:
-                print(f"- {row.side} {row.symbol} qty={row.quantity} price={row.price} status={row.status}")
-            print("Re-run with --execute-cancel to cancel them.")
-        else:
-            print(f"No pending orders found for {target_label}.")
-        return len(matched)
-
-    print(f"Cancelled {cancelled} pending order(s) for {target_label}.")
-    return cancelled
+    return CancelOrdersFlow(adb).cancel_pending(execute=execute, symbol=symbol)
 
 
 def cancel_open_orders(adb: str, symbol: str, *, execute: bool) -> int:
-    return cancel_pending_orders(adb, execute=execute, symbol=symbol)
+    return CancelOrdersFlow(adb).cancel_symbol(symbol, execute=execute)
 
 
 def cancel_all_open_orders(adb: str, *, execute: bool) -> int:
-    return cancel_pending_orders(adb, execute=execute, symbol=None)
+    return CancelOrdersFlow(adb).cancel_all(execute=execute)
 
 
 def positive_decimal(value: str, label: str) -> str:
@@ -1372,6 +2135,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adb", help="Path to adb.exe if it is not on PATH.")
     parser.add_argument("--submit", action="store_true", help="Tap the live Buy Now/Sell Now button after verification.")
     parser.add_argument("--query-holdings", action="store_true", help="Print cash/account balances and stock positions.")
+    parser.add_argument(
+        "--holdings-max-pages",
+        type=int,
+        default=20,
+        help="With --query-holdings, maximum vertical position pages to scan. Default: 20.",
+    )
     parser.add_argument("--json", action="store_true", help="With --query-holdings, print machine-readable JSON.")
     parser.add_argument("--cancel-open-orders", metavar="SYMBOL", help="Cancel all Pending Queue orders for this symbol.")
     parser.add_argument("--cancel-all-open-orders", action="store_true", help="Cancel all Pending Queue orders for every symbol.")
@@ -1420,7 +2189,7 @@ def main() -> int:
     ensure_device(adb)
 
     if args.query_holdings:
-        snapshot = query_holdings(adb)
+        snapshot = QueryHoldingsFlow(adb).query(max_pages=args.holdings_max_pages)
         if args.json:
             print(json.dumps(snapshot, indent=2))
         else:
@@ -1428,11 +2197,11 @@ def main() -> int:
         return 0
 
     if args.cancel_open_orders:
-        cancel_open_orders(adb, args.cancel_open_orders, execute=args.execute_cancel)
+        CancelOrdersFlow(adb).cancel_symbol(args.cancel_open_orders, execute=args.execute_cancel)
         return 0
 
     if args.cancel_all_open_orders:
-        cancel_all_open_orders(adb, execute=args.execute_cancel)
+        CancelOrdersFlow(adb).cancel_all(execute=args.execute_cancel)
         return 0
 
     missing = [name for name in ("symbol", "side", "price", "quantity") if getattr(args, name) is None]
@@ -1444,31 +2213,17 @@ def main() -> int:
             "For holdings use --query-holdings."
         )
 
-    side = args.side.upper()
-
-    root = choose_symbol(adb, args.symbol)
-    root = set_direction(adb, root, side)
-    root = fill_order(adb, root, args.price, args.quantity)
-    final_button = verify_ticket(root, args.symbol, side, args.price, args.quantity)
-
-    print(
-        f"Ticket verified: {side} {normalize_symbol(args.symbol)[1]} "
-        f"{args.quantity} @ {args.price}"
-    )
-
-    if not args.submit:
-        print("Dry run only. Re-run with --submit to tap the live order button.")
-        return 0
-
-    submit_order_with_confirmation(
-        adb,
-        final_button,
-        side,
+    SubmitNewOrderFlow(adb).run(
+        args.symbol,
+        args.side,
+        args.price,
+        args.quantity,
+        submit=args.submit,
         confirm_timeout=args.confirm_timeout,
         result_timeout=args.result_timeout,
         trading_password=args.trading_password or os.environ.get(args.trading_password_env),
-        prompt_trading_password=args.prompt_trading_password,
         trading_password_env=args.trading_password_env,
+        prompt_trading_password=args.prompt_trading_password,
     )
     return 0
 
