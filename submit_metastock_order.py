@@ -15,10 +15,12 @@ import argparse
 import getpass
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ from pathlib import Path
 PACKAGE = "com.metaverse.secu.hk"
 REMOTE_XML = "/sdcard/metastock_window.xml"
 HOLDINGS_SCREENSHOT = Path("metastock_holdings.png")
+HOLDINGS_QUERY_TIMEOUT_SECONDS = 60.0
 
 
 def rid(name: str) -> str:
@@ -1529,6 +1532,23 @@ def is_holdings_screen(words: list[dict]) -> bool:
     )
 
 
+def account_holdings_loaded(words: list[dict]) -> bool:
+    all_text = " ".join(str(word.get("text", "")) for word in words)
+    has_us_account = "US Account" in all_text or "Account(USD)" in all_text
+    return is_holdings_screen(words) and has_us_account and "Position" in all_text
+
+
+def wait_for_account_holdings_loaded(adb: str, *, timeout: float = 3.0) -> list[dict]:
+    deadline = time.time() + timeout
+    last_words: list[dict] = []
+    while time.time() < deadline:
+        time.sleep(0.4)
+        last_words = capture_raw_ocr_words(adb)
+        if account_holdings_loaded(last_words):
+            return last_words
+    return last_words
+
+
 def declared_position_count(words: list[dict]) -> int | None:
     all_text = " ".join(str(word.get("text", "")) for word in words)
     match = re.search(r"Position\s*\((\d+)\)", all_text)
@@ -1577,15 +1597,12 @@ def return_to_holdings_from_account_detail(adb: str) -> list[dict]:
 
 
 def leave_account_detail_if_visible(adb: str) -> bool:
-    for _ in range(4):
-        words = capture_raw_ocr_words(adb)
-        if not is_account_detail_screen(words):
-            time.sleep(0.25)
-            continue
+    words = capture_raw_ocr_words(adb)
+    if not is_account_detail_screen(words):
+        return False
 
-        words = return_to_holdings_from_account_detail(adb)
-        return not is_account_detail_screen(words)
-    return False
+    words = return_to_holdings_from_account_detail(adb)
+    return not is_account_detail_screen(words)
 
 
 def dismiss_position_action_overlay(adb: str) -> None:
@@ -1685,13 +1702,9 @@ class QueryHoldingsFlow(MetaStockFlow):
             launch_metastock_for_ocr(self.adb)
             leave_account_detail_if_visible(self.adb)
             tap_xy(self.adb, 756, 2295)
-            time.sleep(3.0)
-            if leave_account_detail_if_visible(self.adb):
-                tap_xy(self.adb, 756, 2295)
-                time.sleep(3.0)
-            for _ in range(2):
-                scroll_account_to_top(self.adb)
-                time.sleep(0.2)
+            wait_for_account_holdings_loaded(self.adb, timeout=3.0)
+            scroll_account_to_top(self.adb)
+            time.sleep(0.2)
             reset_position_table_layout(self.adb)
             try:
                 words = capture_holdings_words(self.adb)
@@ -1812,8 +1825,27 @@ def open_account_ocr_words(adb: str) -> list[dict]:
     return QueryHoldingsFlow(adb).open_account_words()
 
 
-def query_holdings(adb: str, *, max_pages: int = 20) -> dict:
-    return QueryHoldingsFlow(adb).query(max_pages=max_pages)
+def query_holdings(adb: str, *, max_pages: int = 20, timeout_seconds: float = HOLDINGS_QUERY_TIMEOUT_SECONDS) -> dict:
+    result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result_queue.put(("ok", QueryHoldingsFlow(adb).query(max_pages=max_pages)))
+        except BaseException as exc:
+            result_queue.put(("error", exc))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise AutomationError(f"Holdings query timed out after {timeout_seconds:g} seconds.")
+
+    status, payload = result_queue.get()
+    if status == "error":
+        if isinstance(payload, BaseException):
+            raise payload
+        raise AutomationError(f"Holdings query failed: {payload}")
+    return payload
 
 
 def print_holdings(snapshot: dict) -> None:
@@ -2189,7 +2221,7 @@ def main() -> int:
     ensure_device(adb)
 
     if args.query_holdings:
-        snapshot = QueryHoldingsFlow(adb).query(max_pages=args.holdings_max_pages)
+        snapshot = query_holdings(adb, max_pages=args.holdings_max_pages)
         if args.json:
             print(json.dumps(snapshot, indent=2))
         else:
